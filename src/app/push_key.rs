@@ -256,14 +256,9 @@ impl App {
             });
         }
 
-        // Pre-validate PATH
+        // Pre-validate PATH (portable; not Unix `which`).
         if let Some(first_cmd) = ssh_argv.first() {
-            if std::process::Command::new("which")
-                .arg(first_cmd)
-                .output()
-                .map(|o| !o.status.success())
-                .unwrap_or(true)
-            {
+            if !crate::command_path::command_exists(first_cmd) {
                 let msg = format!(
                     "Command not found: '{}'. Check your PATH or install it.",
                     first_cmd

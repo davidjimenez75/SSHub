@@ -298,18 +298,15 @@ pub fn wrap_script_command(log_path: &Path, inner_argv: &[String]) -> Option<Vec
 }
 
 fn script_binary() -> Option<&'static str> {
-    if std::process::Command::new("which")
-        .arg("script")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if crate::command_path::command_exists("script") {
         Some("script")
     } else {
         None
     }
 }
 
+// Only `script -c` on Linux needs a single shell-joined string.
+#[cfg(target_os = "linux")]
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| shell_quote(a))
@@ -317,6 +314,7 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(target_os = "linux")]
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".into();

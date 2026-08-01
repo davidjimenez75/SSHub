@@ -1,6 +1,7 @@
 pub mod app;
 pub mod broadcast;
 pub mod cli;
+pub mod command_path;
 pub mod config;
 pub mod credentials;
 pub mod hosts;
@@ -44,7 +45,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -132,6 +133,10 @@ where
         terminal.draw(|frame| state.render(frame))?;
         if event::poll(Duration::from_millis(33))? {
             if let Event::Key(key) = event::read()? {
+                // Windows emits Press + Release for every key; only act on Press.
+                if !is_key_press(key) {
+                    continue;
+                }
                 match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Esc | KeyCode::Char('q') => {
                         break;
@@ -314,6 +319,15 @@ fn apply_auto_quit(app: &mut App, auto_quit: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// True for key events that should drive the UI.
+///
+/// On Windows, crossterm delivers both `KeyEventKind::Press` and `Release` for
+/// every physical key. Unix typically only delivers `Press`. Treating Release
+/// as input doubles every character typed into forms and search fields.
+fn is_key_press(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
 fn poll_keys_and_watcher(app: &mut App) -> Result<()> {
     // While a panel animation is playing, shorten the poll window so the render
     // loop redraws at ~60fps and the slide is smooth; otherwise idle at 20fps.
@@ -327,7 +341,11 @@ fn poll_keys_and_watcher(app: &mut App) -> Result<()> {
         // paste into an embedded session crawl at ~20 chars/sec.
         loop {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key)?,
+                // Windows (and enhanced keyboards) report Press + Release for
+                // each key. Handling both inserts every character twice in forms
+                // ("192." → "119922.."). Accept Press and held-key Repeat only.
+                Event::Key(key) if is_key_press(key) => app.handle_key(key)?,
+                Event::Key(_) => {}
                 Event::Mouse(mouse) => app.handle_mouse(mouse)?,
                 Event::Paste(text) => app.handle_paste(&text)?,
                 _ => {}

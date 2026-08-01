@@ -155,15 +155,9 @@ fn cmd_connect(ctx: &mut CliContext, args: &[String]) -> Result<i32> {
     );
 
     if let Some(cmd) = argv.first() {
-        // Best-effort pre-flight. If `which` itself cannot run (missing from
-        // PATH), fail open (unwrap_or(false)) rather than blocking a valid ssh:
-        // a genuinely missing program is still caught by the spawn error below.
-        if Command::new("which")
-            .arg(cmd)
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(false)
-        {
+        // Portable PATH check (no Unix `which` — missing on Windows and used to
+        // false-negative TUI connects via unwrap_or(true)).
+        if !crate::command_path::command_exists(cmd) {
             eprintln!("sshub: command not found: '{cmd}'");
             return Ok(1);
         }

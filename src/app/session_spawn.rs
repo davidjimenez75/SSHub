@@ -21,12 +21,7 @@ impl App {
         };
 
         if let Some(first_cmd) = argv.first() {
-            if std::process::Command::new("which")
-                .arg(first_cmd)
-                .output()
-                .map(|o| !o.status.success())
-                .unwrap_or(true)
-            {
+            if !crate::command_path::command_exists(first_cmd) {
                 let msg = format!(
                     "Command not found: '{}'. Check your PATH or install it.",
                     first_cmd

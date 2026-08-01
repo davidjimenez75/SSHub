@@ -57,13 +57,9 @@ impl App {
         }
 
         // Pre-validate: check that the first command binary exists on PATH
+        // (portable — do not shell out to Unix `which`, which is missing on Windows).
         if let Some(first_cmd) = session_argv.first() {
-            if std::process::Command::new("which")
-                .arg(first_cmd)
-                .output()
-                .map(|o| !o.status.success())
-                .unwrap_or(true)
-            {
+            if !crate::command_path::command_exists(first_cmd) {
                 let msg = format!(
                     "Command not found: '{}'. Check your PATH or install it.",
                     first_cmd

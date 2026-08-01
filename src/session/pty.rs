@@ -4,13 +4,23 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 const READ_BUF: usize = 4096;
+
+/// ConPTY (via portable-pty) enables `PSEUDOCONSOLE_INHERIT_CURSOR`, which makes
+/// the host emit a Device Status Report request (`ESC [ 6 n`) and **blocks the
+/// child until the terminal answers** with a Cursor Position Report
+/// (`ESC [ row ; col R`). Without an auto-reply, Windows embedded sessions hang
+/// forever after spawn — ssh never even prints its version banner.
+const DSR_REQUEST: &[u8] = b"\x1b[6n";
+/// CPR reply: cursor at 1;1 is enough to unblock ConPTY; the real grid position
+/// is tracked by our vt100 parser for display, not for this handshake.
+const CPR_REPLY: &[u8] = b"\x1b[1;1R";
 
 /// Event from the PTY reader thread to the main thread.
 #[derive(Debug)]
@@ -132,7 +142,8 @@ mod stderr_fifo {
 
 pub struct PtyRuntime {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread so it can auto-answer ConPTY DSR queries.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: Receiver<PtyEvent>,
     /// Set when the reader has signalled EOF / child exit. Used so we don't
     /// keep spinning on a dead PTY.
@@ -214,7 +225,10 @@ impl PtyRuntime {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
-        let writer = pair.master.take_writer().context("take pty writer")?;
+        let writer = Arc::new(Mutex::new(
+            pair.master.take_writer().context("take pty writer")?,
+        ));
+        let writer_for_reader = Arc::clone(&writer);
 
         let (tx, rx) = mpsc::channel();
         let closed = Arc::new(AtomicBool::new(false));
@@ -234,6 +248,9 @@ impl PtyRuntime {
             .name("sshub-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; READ_BUF];
+                // Carry incomplete ESC-sequences across reads so a split
+                // `\x1b` / `[6n` still triggers a CPR reply.
+                let mut dsr_window: Vec<u8> = Vec::with_capacity(8);
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
@@ -241,7 +258,11 @@ impl PtyRuntime {
                             break;
                         }
                         Ok(n) => {
-                            if tx.send(PtyEvent::Bytes(buf[..n].to_vec())).is_err() {
+                            let chunk = &buf[..n];
+                            if maybe_answer_dsr(&mut dsr_window, chunk, &writer_for_reader) {
+                                // CPR written; keep draining app output.
+                            }
+                            if tx.send(PtyEvent::Bytes(chunk.to_vec())).is_err() {
                                 break;
                             }
                         }
@@ -276,8 +297,12 @@ impl PtyRuntime {
 
     /// Write bytes to the master side. Called for each forwarded keystroke.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush().ok();
+        let mut guard = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("pty writer lock poisoned"))?;
+        guard.write_all(bytes)?;
+        guard.flush().ok();
         Ok(())
     }
 
@@ -314,6 +339,39 @@ impl PtyRuntime {
     }
 }
 
+/// Scan `chunk` (with a small carry-over window) for ConPTY DSR requests and
+/// answer each with a CPR. Returns true if at least one reply was written.
+fn maybe_answer_dsr(
+    window: &mut Vec<u8>,
+    chunk: &[u8],
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+) -> bool {
+    window.extend_from_slice(chunk);
+    let mut answered = false;
+    while let Some(pos) = find_subslice(window, DSR_REQUEST) {
+        if let Ok(mut w) = writer.lock() {
+            if w.write_all(CPR_REPLY).is_ok() {
+                let _ = w.flush();
+                answered = true;
+            }
+        }
+        // Drop the matched request so we don't re-answer it.
+        let end = pos + DSR_REQUEST.len();
+        window.drain(..end);
+    }
+    // Keep only a short tail — enough to match a DSR split across reads.
+    const KEEP: usize = 3; // len(DSR_REQUEST) - 1
+    if window.len() > KEEP {
+        let drain = window.len() - KEEP;
+        window.drain(..drain);
+    }
+    answered
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Kill the embedded ssh child and its process group, then reap it.
 fn terminate_child_process(child: &mut dyn portable_pty::Child) {
     #[cfg(unix)]
@@ -342,8 +400,82 @@ impl Drop for PtyRuntime {
         if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
+        // Dropping the master/writer closes the ConPTY pipe so a blocked
+        // reader.read() unblocks with EOF instead of hanging the UI thread.
+        // portable-pty's reader does not always see child-exit alone on Windows.
+        let _ = self.writer.lock().map(|mut w| {
+            let _ = w.flush();
+        });
+        // Replace writer with a sink so further locks succeed briefly, then
+        // drop the master handle by taking it out of the option-less field —
+        // we can't easily drop master without restructuring; join with a
+        // timeout-style detach instead: if the reader is still blocked after
+        // kill, abandon the join so Drop cannot freeze the app.
         if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
+            // Fast path: reader already finished.
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // Last resort: spawn a reaper so we never block Drop. Leaking
+                // the JoinHandle is intentional — better than a stuck quit.
+                thread::spawn(move || {
+                    let _ = handle.join();
+                });
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+    fn sink() -> (Arc<Mutex<Vec<u8>>>, SharedWriter) {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(Buf(Arc::clone(&data)))));
+        (data, writer)
+    }
+
+    #[test]
+    fn find_subslice_locates_dsr() {
+        assert_eq!(find_subslice(b"abc\x1b[6ndef", DSR_REQUEST), Some(3));
+        assert_eq!(find_subslice(b"nope", DSR_REQUEST), None);
+    }
+
+    #[test]
+    fn answers_dsr_split_across_chunks() {
+        let (data, writer) = sink();
+        let mut window = Vec::new();
+        // Split ESC [ 6 n across two reads.
+        assert!(!maybe_answer_dsr(&mut window, b"\x1b[", &writer));
+        assert!(data.lock().unwrap().is_empty());
+        assert!(maybe_answer_dsr(&mut window, b"6n", &writer));
+        assert_eq!(data.lock().unwrap().as_slice(), CPR_REPLY);
+    }
+
+    #[test]
+    fn answers_multiple_dsr_in_one_chunk() {
+        let (data, writer) = sink();
+        let mut window = Vec::new();
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(DSR_REQUEST);
+        chunk.extend_from_slice(b"noise");
+        chunk.extend_from_slice(DSR_REQUEST);
+        assert!(maybe_answer_dsr(&mut window, &chunk, &writer));
+        let out = data.lock().unwrap().clone();
+        assert_eq!(out, [CPR_REPLY, CPR_REPLY].concat());
     }
 }

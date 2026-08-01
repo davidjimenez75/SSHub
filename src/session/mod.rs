@@ -463,6 +463,17 @@ impl Session {
         while let Some(event) = self.runtime.try_recv() {
             match event {
                 PtyEvent::Bytes(bytes) => {
+                    // On Windows there is no stderr FIFO: ssh `-v` is merged into
+                    // the PTY stream. Mirror it into `debug_log` so connected /
+                    // failure needles still match (Unix fills this only via Stderr).
+                    #[cfg(windows)]
+                    {
+                        self.debug_log.push_str(&String::from_utf8_lossy(&bytes));
+                        if self.debug_log.len() > DEBUG_LOG_CAP {
+                            let cut = self.debug_log.len() - DEBUG_LOG_CAP;
+                            self.debug_log.drain(..cut);
+                        }
+                    }
                     self.parser.process(&bytes);
                     if let Some(log) = self.log.as_mut() {
                         if log.append(&bytes).is_err() {

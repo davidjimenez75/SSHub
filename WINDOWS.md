@@ -142,11 +142,26 @@ cargo build --release
 
 You are on an older tree without the Windows port. Build from a branch that includes the Windows `cfg` changes (or upstream once merged).
 
-### TUI starts but connect fails
+### TUI starts but connect fails with `Command not found: 'ssh'`
 
-- Ensure `ssh` is on `PATH` (`where.exe ssh`)
+Older Windows builds preflighted with Unix `which`, which is not on Windows PATH,
+so SSHub reported `ssh` missing even when OpenSSH was installed. Current trees
+resolve executables by walking `PATH` + `PATHEXT` instead.
+
+Still check:
+
+- `where.exe ssh` finds `ssh.exe` (usually `C:\Windows\System32\OpenSSH\ssh.exe`)
 - Test the same host with `ssh user@host` outside SSHub
 - Host keys / agent: Windows OpenSSH uses `%USERPROFILE%\.ssh` and the Windows OpenSSH Authentication Agent when enabled
+- If you only added OpenSSH to PATH in the current shell, restart SSHub from that same shell (or set PATH system-wide and open a new terminal)
+
+### TUI connects hang on “connecting…” (CLI `sshub host connect` works)
+
+Windows ConPTY (via `portable-pty`) emits a cursor-position query (`ESC [ 6 n`)
+and **blocks the child until the terminal answers**. SSHub auto-replies with a
+Cursor Position Report. If you are on a build from before that fix, sessions
+spawn but never show the SSH banner/prompt even though the same host works in
+PowerShell or `sshub host connect`.
 
 ### Link / MSVC errors
 
