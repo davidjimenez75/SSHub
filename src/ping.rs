@@ -60,7 +60,13 @@ fn ping_loop(hosts: Vec<(String, String)>, interval: Duration, tx: Sender<PingRe
 }
 
 fn ping_once(name: &str, address: &str) -> PingResult {
-    // Use `ping -c 1 -W 1` (1 attempt, 1 second timeout)
+    // Unix: `ping -c 1 -W 1` (1 attempt, 1 second timeout)
+    // Windows: `ping -n 1 -w 1000` (count + timeout in milliseconds)
+    #[cfg(windows)]
+    let output = Command::new("ping")
+        .args(["-n", "1", "-w", "1000", address])
+        .output();
+    #[cfg(not(windows))]
     let output = Command::new("ping")
         .args(["-c", "1", "-W", "1", address])
         .output();
@@ -81,16 +87,38 @@ fn ping_once(name: &str, address: &str) -> PingResult {
 }
 
 fn parse_ping_time(output: &str) -> Option<u32> {
-    // Linux: "time=12.3 ms"  macOS: "time=12.345 ms"
+    // Linux/macOS: "time=12.3 ms"
+    // Windows EN: "time=12ms" / "time<1ms"
+    // Windows ES: "Tiempo=12ms" / "Media = 12ms"
     for line in output.lines() {
-        if let Some(pos) = line.find("time=") {
-            let after = &line[pos + 5..];
-            let num_str: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if let Ok(ms) = num_str.parse::<f64>() {
-                return Some(ms.round() as u32);
+        let lower = line.to_ascii_lowercase();
+        for key in ["time=", "tiempo=", "time<", "tiempo<"] {
+            if let Some(pos) = lower.find(key) {
+                let after = &line[pos + key.len()..];
+                let num_str: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if num_str.is_empty() {
+                    // time<1ms → treat as 1ms
+                    return Some(1);
+                }
+                if let Ok(ms) = num_str.parse::<f64>() {
+                    return Some(ms.round() as u32);
+                }
+            }
+        }
+        // Fallback: "Average = 12ms" / "Media = 12ms"
+        for key in ["average = ", "media = "] {
+            if let Some(pos) = lower.find(key) {
+                let after = &line[pos + key.len()..];
+                let num_str: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(ms) = num_str.parse::<f64>() {
+                    return Some(ms.round() as u32);
+                }
             }
         }
     }

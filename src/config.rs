@@ -340,14 +340,28 @@ fn merge_toml_table(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
     }
 }
 
+/// Home directory: `$HOME`, or `$USERPROFILE` on Windows.
+fn home_dir() -> anyhow::Result<String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| anyhow::anyhow!("HOME/USERPROFILE not set"))
+}
+
 /// Config directory (`~/.config/sshub` or `SSHUB_CONFIG_DIR`).
 /// Falls back to `SSH_LAUNCHER_CONFIG_DIR` for backward compatibility.
+/// On Windows without overrides: `%APPDATA%\sshub`.
 /// Migrates data from `~/.config/ssh-launcher` if the new path doesn't exist yet.
 pub fn config_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Some(dir) = env_dir("SSHUB_CONFIG_DIR").or_else(|| env_dir("SSH_LAUNCHER_CONFIG_DIR")) {
         return Ok(dir);
     }
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(appdata).join("sshub"));
+        }
+    }
+    let home = home_dir()?;
     let new_dir = std::path::PathBuf::from(&home).join(".config/sshub");
     let legacy_dir = std::path::PathBuf::from(&home).join(".config/ssh-launcher");
     migrate_legacy_dir(&new_dir, &legacy_dir);
@@ -356,12 +370,19 @@ pub fn config_dir() -> anyhow::Result<std::path::PathBuf> {
 
 /// Data directory for SQLite (`~/.local/share/sshub` or `SSHUB_DATA_DIR`).
 /// Falls back to `SSH_LAUNCHER_DATA_DIR` for backward compatibility.
+/// On Windows without overrides: `%LOCALAPPDATA%\sshub`.
 /// Migrates data from `~/.local/share/ssh-launcher` if the new path doesn't exist yet.
 pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Some(dir) = env_dir("SSHUB_DATA_DIR").or_else(|| env_dir("SSH_LAUNCHER_DATA_DIR")) {
         return Ok(dir);
     }
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(local).join("sshub"));
+        }
+    }
+    let home = home_dir()?;
     let new_dir = std::path::PathBuf::from(&home).join(".local/share/sshub");
     let legacy_dir = std::path::PathBuf::from(&home).join(".local/share/ssh-launcher");
     migrate_legacy_dir(&new_dir, &legacy_dir);

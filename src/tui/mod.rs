@@ -27,13 +27,26 @@ pub fn fit_popup(desired: u16, min: u16, avail: u16) -> u16 {
 
 /// Convert a Unix epoch timestamp to `"HH:MM:SS"` in the local timezone.
 ///
-/// Uses libc `localtime_r` (reentrant, no allocation) so we stay
-/// dependency-free beyond what the project already pulls in transitively.
+/// Uses the platform reentrant localtime helper so we stay dependency-free
+/// beyond what the project already pulls in transitively.
 pub fn format_local_time(epoch_secs: i64) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let time_t = epoch_secs as libc::time_t;
-    // SAFETY: localtime_r is reentrant and writes into our stack-local `tm`.
-    unsafe { libc::localtime_r(&time_t, &mut tm) };
+    // SAFETY: writes into our stack-local `tm`.
+    #[cfg(unix)]
+    unsafe {
+        libc::localtime_r(&time_t, &mut tm);
+    }
+    // Windows MSVC: localtime_s(dest, src) — argument order is reversed vs POSIX.
+    #[cfg(windows)]
+    unsafe {
+        let _ = libc::localtime_s(&mut tm, &time_t);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = time_t;
+        return "??:??:??".to_string();
+    }
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 

@@ -543,17 +543,27 @@ impl App {
         match side {
             Side::Remote => unreachable!("the remote pane always has a channel"),
             Side::Local => {
-                use std::os::unix::fs::PermissionsExt;
-                match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
-                    Ok(()) => {
-                        self.sftp_prompt = None;
-                        self.mode = AppMode::Normal;
-                        self.sftp_refresh_panes();
-                    }
-                    Err(e) => {
-                        if let Some(p) = self.sftp_prompt.as_mut() {
-                            p.error = Some(format!("{e}"));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                        Ok(()) => {
+                            self.sftp_prompt = None;
+                            self.mode = AppMode::Normal;
+                            self.sftp_refresh_panes();
                         }
+                        Err(e) => {
+                            if let Some(p) = self.sftp_prompt.as_mut() {
+                                p.error = Some(format!("{e}"));
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (path, mode);
+                    if let Some(p) = self.sftp_prompt.as_mut() {
+                        p.error = Some("local chmod is not supported on this platform".into());
                     }
                 }
             }
@@ -1355,10 +1365,20 @@ fn read_local_dir(path: &Path) -> Vec<FileEntry> {
             let meta = std::fs::metadata(entry.path()).ok();
             let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let perm = meta.as_ref().map(|m| {
-                use std::os::unix::fs::PermissionsExt;
-                m.permissions().mode() & 0o7777
-            });
+            let perm = {
+                #[cfg(unix)]
+                {
+                    meta.as_ref().map(|m| {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode() & 0o7777
+                    })
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = &meta;
+                    None
+                }
+            };
             out.push(FileEntry {
                 name,
                 is_dir,
